@@ -1,0 +1,232 @@
+x-app-env: &app-env
+  DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-payments}:${POSTGRES_PASSWORD:-payments}@db:5432/${POSTGRES_DB:-payments}
+  RABBITMQ_URL: amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASSWORD:-guest}@rabbitmq:5672/
+  API_KEY: ${API_KEY:-dev-only-api-key-change-me}
+  ENVIRONMENT: ${ENVIRONMENT:-local}
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  DB_ECHO: ${DB_ECHO:-false}
+  OUTBOX_POLL_INTERVAL: ${OUTBOX_POLL_INTERVAL:-1.0}
+  OUTBOX_BATCH_SIZE: ${OUTBOX_BATCH_SIZE:-100}
+  GATEWAY_MIN_DELAY: ${GATEWAY_MIN_DELAY:-2}
+  GATEWAY_MAX_DELAY: ${GATEWAY_MAX_DELAY:-5}
+  GATEWAY_SUCCESS_RATE: ${GATEWAY_SUCCESS_RATE:-0.9}
+  RETRY_MAX_ATTEMPTS: ${RETRY_MAX_ATTEMPTS:-3}
+  RETRY_BASE_DELAY: ${RETRY_BASE_DELAY:-2}
+  WEBHOOK_TIMEOUT: ${WEBHOOK_TIMEOUT:-10}
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-payments}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-payments}
+      POSTGRES_DB: ${POSTGRES_DB:-payments}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-payments} -d ${POSTGRES_DB:-payments}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  rabbitmq:
+    image: rabbitmq:4-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-guest}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-guest}
+    ports:
+      - "${RABBITMQ_PORT:-5672}:5672"
+      - "${RABBITMQ_MANAGEMENT_PORT:-15672}:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    # edge — чтобы открыть management UI с хоста и дать e2e заглянуть в DLQ.
+    networks:
+      - data
+      - edge
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+    restart: unless-stopped
+
+  migrate:
+    image: payment-service-api
+    build:
+      context: .
+      target: runtime
+    environment:
+      <<: *app-env
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - data
+    entrypoint: ["/app/docker/migrate.sh"]
+    restart: "no"
+
+  api:
+    image: payment-service-api
+    build:
+      context: .
+      target: runtime
+    environment:
+      <<: *app-env
+    ports:
+      - "${API_PORT:-8000}:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    networks:
+      - data
+      - edge
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/ready')",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped
+
+  # Читает outbox и публикует события в RabbitMQ. Несколько реплик безопасны: SKIP LOCKED.
+  outbox-relay:
+    image: payment-service-api
+    build:
+      context: .
+      target: runtime
+    environment:
+      <<: *app-env
+    command: ["faststream", "run", "payments.workers.relay:app"]
+    depends_on:
+      db:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    networks:
+      - data
+    restart: unless-stopped
+
+  # Обрабатывает payments.new: шлюз, статус в БД, webhook, retry и DLQ.
+  # edge нужен для webhook на внешние адреса.
+  consumer:
+    image: payment-service-api
+    build:
+      context: .
+      target: runtime
+    environment:
+      <<: *app-env
+    command: ["faststream", "run", "payments.workers.consumer:app"]
+    depends_on:
+      db:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    networks:
+      - data
+      - edge
+    restart: unless-stopped
+
+  # Приёмник webhook для ручной проверки и e2e. Пути /hooks/fail-* отвечают 500.
+  webhook-sink:
+    image: payment-service-tests-e2e
+    build:
+      context: .
+      target: e2e
+    command: ["python", "-m", "tests.e2e.webhook_sink"]
+    ports:
+      - "${WEBHOOK_SINK_PORT:-8081}:8080"
+    networks:
+      - edge
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health')",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  tests-unit:
+    image: payment-service-tests-unit
+    build:
+      context: .
+      target: test
+    environment:
+      <<: *app-env
+      ENVIRONMENT: test
+      LOG_LEVEL: WARNING
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    networks:
+      - data
+    volumes:
+      - ./src:/app/src
+      - ./tests:/app/tests
+      - ./alembic:/app/alembic
+      - ./alembic.ini:/app/alembic.ini
+      - ./pyproject.toml:/app/pyproject.toml
+    restart: unless-stopped
+
+  tests-e2e:
+    image: payment-service-tests-e2e
+    build:
+      context: .
+      target: e2e
+    environment:
+      E2E_BASE_URL: ${E2E_BASE_URL:-http://api:8000}
+      E2E_API_PREFIX: ${E2E_API_PREFIX:-/api/v1}
+      E2E_API_KEY: ${API_KEY:-dev-only-api-key-change-me}
+      # Адрес приёмника так, как его видит consumer, и так, как его видят тесты.
+      E2E_WEBHOOK_SINK_URL: ${E2E_WEBHOOK_SINK_URL:-http://webhook-sink:8080}
+      E2E_RABBITMQ_API_URL: ${E2E_RABBITMQ_API_URL:-http://rabbitmq:15672}
+      E2E_RABBITMQ_USER: ${RABBITMQ_USER:-guest}
+      E2E_RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-guest}
+    depends_on:
+      api:
+        condition: service_healthy
+      webhook-sink:
+        condition: service_healthy
+      consumer:
+        condition: service_started
+      outbox-relay:
+        condition: service_started
+    networks:
+      - edge
+    volumes:
+      # Для локальной разработки: править тесты без пересборки образа.
+      # В CI/проде том можно не монтировать — тесты уже в образе.
+      - ./tests/e2e:/app/tests/e2e
+    restart: unless-stopped
+
+networks:
+  data:
+    internal: true
+  edge:
+
+volumes:
+  postgres_data:
+  rabbitmq_data:
